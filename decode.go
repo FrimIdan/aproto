@@ -8,69 +8,83 @@ import (
 	"github.com/golang/protobuf/proto"
 )
 
-// 0	Varint	int32, int64, uint32, uint64, sint32, sint64, bool, enum
-// 1	64-bit	fixed64, sfixed64, double
-// 2	Length-delimited	string, bytes, embedded messages, packed repeated fields
-// 3	Start group	groups (deprecated)
-// 4	End group	groups (deprecated)
-// 5	32-bit	fixed32, sfixed32, float
-func decode_1_chunk(
-	data []byte,
-) (chk Chunk, chunk_len uint64, e error) {
+// gRPC has some additional header - remove it
+func skipGrpcHeaderIfNeeded(data []byte) []byte {
 	pos := 0
 
-	id_type, id_type_len := proto.DecodeVarint(data)
-	if id_type_len <= 0 || id_type_len > 16 {
-		e = errors.New("malformed id_type_len")
+	if (data[pos] != 0) {
+		// no header
+		return data
+	}
+
+	pos++;
+	length := binary.BigEndian.Uint32(data[pos : pos+4]);
+	pos += 4;
+	if length > uint32(len(data[pos:])) {
+		// something is wrong, return original data
+		return data
+	}
+
+	return data[pos:]
+}
+
+func decodeChunk(data []byte) (chk Chunk, chunkLen uint64, e error) {
+	pos := 0
+
+	// Each key in the streamed message is a varint with the value (field_number << 3) | wire_type
+	// in other words, the last three bits of the number store the wire type.
+	keyType, keyTypeLen := proto.DecodeVarint(data)
+	if keyTypeLen <= 0 || keyTypeLen > 16 {
+		e = errors.New("malformed keyTypeLen")
 		return
 	}
-	pos += id_type_len
+	pos += keyTypeLen
 
 	if pos >= len(data) {
 		e = errors.New("not enough data for any furter wire type")
 		return
 	}
 
-	id := int(id_type >> 3)
-
-	if id > 536870911 { // max field: 2^29 - 1 == 536870911
+	fieldNumber := int(keyType >> 3)
+	if fieldNumber > 536870911 { // max field: 2^29 - 1 == 536870911
 		e = errors.New("field number > 2^29-1")
 		return
 	}
-	_type := id_type & 7
 
-	id_type_bytes := data[0:id_type_len]
+	wireType := keyType & 7
 
-	chunk_len += uint64(id_type_len)
+	keyTypeBytes := data[0:keyTypeLen]
 
-	switch _type {
-	case 0: // varint
+	chunkLen += uint64(keyTypeLen)
+
+	switch wireType {
+	case proto.WireVarint: // int32, int64, uint32, uint64, sint32, sint64, bool, enum
 		// overflow, not enough data
 		if pos+1 > len(data) {
 			e = errors.New("not enough data for wire type 0(varint)")
 			return
 		}
 
-		u64, u64_len := proto.DecodeVarint(data[pos:])
-		if u64 == 0 && u64_len == 0 {
+		u64, u64Len := proto.DecodeVarint(data[pos:])
+		if u64 == 0 && u64Len == 0 {
 			e = errors.New("fail DecodeVarint()")
 			return
 		}
 		chk = &Varint{
 			Value: u64,
 			IdType: IdType{
-				Id:   id,
-				Type: _type,
-				data: id_type_bytes,
+				Id:   fieldNumber,
+				Type: wireType,
+				data: keyTypeBytes,
 			},
 		}
 
-		chunk_len += uint64(u64_len)
+		chunkLen += uint64(u64Len)
 
-	case 1: // fixed 64 / double
+	case proto.WireFixed64: // fixed64, sfixed64, double
 		// overflow, not enough data
 		if pos+8 > len(data) {
-			// fmt.Println("pos: ", pos, ", len(data): ", len(data), ", s_len: ", int(s_len))
+			// fmt.Println("pos: ", pos, ", len(data): ", len(data), ", sLen: ", int(sLen))
 			e = errors.New("not enough data for wire type 1(fixed64)")
 			return
 		}
@@ -78,42 +92,42 @@ func decode_1_chunk(
 		chk = &Fixed64{
 			Value: u64,
 			IdType: IdType{
-				Id:   id,
-				Type: _type,
-				data: id_type_bytes,
+				Id:   fieldNumber,
+				Type: wireType,
+				data: keyTypeBytes,
 			},
 		}
 
-		chunk_len += 8
+		chunkLen += 8
 
-	case 2: // struct / string
-		s_len, s_len_len := proto.DecodeVarint(data[pos:])
-		if s_len == 0 && s_len_len == 0 {
+	case proto.WireStartGroup, proto.WireEndGroup, proto.WireBytes: // string, bytes, embedded messages, packed repeated fields
+		sLen, sLenLen := proto.DecodeVarint(data[pos:])
+		if sLen == 0 && sLenLen == 0 {
 			e = errors.New("fail DecodeVarint()")
 			return
 		}
-		chunk_len += uint64(s_len_len)
-		pos += s_len_len
+		chunkLen += uint64(sLenLen)
+		pos += sLenLen
 
 		// overflow, not enough data
-		if uint64(pos)+s_len > uint64(len(data)) {
+		if uint64(pos)+sLen > uint64(len(data)) {
 			e = errors.New("not enough data for wire type 2(string)")
 			return
 		}
 
-		str := data[pos : pos+int(s_len)]
+		str := data[pos : pos+int(sLen)]
 
 		_struct := &Struct{
 			DataLen: len(str),
 			IdType: IdType{
-				Id:   id,
-				Type: _type,
-				data: id_type_bytes,
+				Id:   fieldNumber,
+				Type: wireType,
+				data: keyTypeBytes,
 			},
 		}
 
 		// try to decode as inner struct first
-		chunks, err2 := decode_all_chunks(str)
+		chunks, err2 := DecodeAllChunks(str)
 
 		// if decode success, treat as struct
 		if err2 == nil {
@@ -121,22 +135,16 @@ func decode_1_chunk(
 			_struct.Str = str
 			chk = _struct
 
-			chunk_len += uint64(s_len)
+			chunkLen += sLen
 			return
 		} else { // decode fail, just treat as string
 			_struct.Str = str
 			chk = _struct
 
-			chunk_len += uint64(s_len)
+			chunkLen += sLen
 		}
 
-	case 3:
-		e = errors.New("[proto 3] not implemented")
-		return
-	case 4:
-		e = errors.New("[proto 4] not implemented")
-		return
-	case 5: // fixed 32 / float
+	case proto.WireFixed32: // fixed32, sfixed32, float
 		if pos+4 > len(data) {
 			e = errors.New("not enough data for wire type 5(fixed32)")
 			return
@@ -146,30 +154,39 @@ func decode_1_chunk(
 		chk = &Fixed32{
 			value: u32,
 			IdType: IdType{
-				Id:   id,
-				Type: _type,
-				data: id_type_bytes,
+				Id:   fieldNumber,
+				Type: wireType,
+				data: keyTypeBytes,
 			},
 		}
 
-		chunk_len += 4
+		chunkLen += 4
+
+	//case : // deprecated
+	//	return nil, chunkLen, nil
+
 	default:
-		e = errors.New(fmt.Sprintf("Unknown wire type %d of id_type %x", _type, id_type))
+		e = errors.New(fmt.Sprintf("Unknown wire type %d of keyType %x", wireType, keyType))
 		return
 	}
 	return
 }
-func decode_all_chunks(data []byte) ([]Chunk, error) {
+func DecodeAllChunks(data []byte) ([]Chunk, error) {
 	var pos uint64 = 0
 	var ret []Chunk
 
+	data = skipGrpcHeaderIfNeeded(data)
+
 	for pos < uint64(len(data)) {
-		chunk, chunk_len, e := decode_1_chunk(data[pos:])
+		chunk, chunkLen, e := decodeChunk(data[pos:])
 		if e != nil {
 			return ret, e
 		}
-		ret = append(ret, chunk)
-		pos += chunk_len
+
+		if chunk != nil {
+			ret = append(ret, chunk)
+		}
+		pos += chunkLen
 	}
 
 	return ret, nil
@@ -177,7 +194,7 @@ func decode_all_chunks(data []byte) ([]Chunk, error) {
 
 // dump with all kinds of Renderer
 func TryDumpEx(data []byte, r Renderer) (string, error) {
-	chunks, e := decode_all_chunks(data)
+	chunks, e := DecodeAllChunks(data)
 	if e != nil {
 		return ``, e
 	}

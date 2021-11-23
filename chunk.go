@@ -47,9 +47,8 @@ type IdType struct {
 }
 
 func (x *IdType) Render(indent string, r Renderer) string {
-	return fmt.Sprintf("%s[%s] %s %s: ",
+	return fmt.Sprintf("%s %s %s: ",
 		indent,
-		r.IDTYPE(fmt.Sprintf("% x", x.data)),
 		r.ID(fmt.Sprintf("%d", x.Id)),
 		r.TYPE(type_str(ChunkType(x.Type))),
 	)
@@ -68,9 +67,8 @@ type Varint struct {
 
 func (x *Varint) Render(indent string, r Renderer) string {
 	return x.IdType.Render(indent, r) +
-		fmt.Sprintf("%s (%s)",
+		fmt.Sprintf("%s",
 			r.NUM(fmt.Sprintf("%d", int64(x.Value))),
-			r.NUM(fmt.Sprintf("0x%x", x.Value)),
 		)
 }
 func (x *Varint) Type() ChunkType {
@@ -110,7 +108,7 @@ type Struct struct {
 func (x *Struct) Render(indent string, r Renderer) string {
 	ret := x.IdType.Render(indent, r)
 
-	ret += fmt.Sprintf("(%d): ", x.DataLen) // show length first
+	//ret += fmt.Sprintf("(%d): ", x.DataLen) // show length first
 
 	if x.Children != nil { // is struct
 
@@ -149,10 +147,10 @@ func (x *Struct) Render(indent string, r Renderer) string {
 			}
 			ret += r.STR(string(bs))
 
-			// in practice, string may contain special character, also print hex dump if string is short
-			if len(x.Str) <= 8 && len(x.Str) > 0 {
-				ret += " (" + r.STR(fmt.Sprintf("% x", x.Str)) + ")"
-			}
+			//// in practice, string may contain special character, also print hex dump if string is short
+			//if len(x.Str) <= 8 && len(x.Str) > 0 {
+			//	ret += " (" + r.STR(fmt.Sprintf("% x", x.Str)) + ")"
+			//}
 		} else {
 			if len(x.Str) > 32 { // too long, only show first 32 bytes, and "..."
 				ret += r.STR(fmt.Sprintf("% x", x.Str[0:32]))
@@ -180,7 +178,6 @@ func (x *Fixed32) Render(indent string, r Renderer) string {
 	return x.IdType.Render(indent, r) +
 		fmt.Sprintf("%s (%s) (%s)",
 			fmt.Sprintf("%d", int32(x.value)),
-			fmt.Sprintf("0x%x", x.value),
 			fmt.Sprintf("%f", f32),
 		)
 }
